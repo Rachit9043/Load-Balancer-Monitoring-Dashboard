@@ -25,7 +25,7 @@ const int BACKEND_COUNT = 3;
 int current_backend = 0;
 
 int main() {
-    // Create the load balancer's TCP socket
+    // Create a new tcp socket for load balancer
     int lb_socket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (lb_socket < 0) {
@@ -37,7 +37,7 @@ int main() {
     setsockopt(lb_socket, SOL_SOCKET, SO_REUSEADDR,
                &opt, sizeof(opt));
 
-    // Configure the load balancer to listen on port 8080
+    // make the load balancer listen on port number 8080
     sockaddr_in lb_address{};
     lb_address.sin_family = AF_INET;
     lb_address.sin_addr.s_addr = INADDR_ANY;

@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Allow reuse of the port
+    
     int opt = 1;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -91,7 +91,7 @@ int main(int argc, char* argv[]) {
                  << " received: "
                  << buffer << endl;
 
-            // Prepare response
+            // Response
             string response =
                 "Hello from Backend Server " +
                 to_string(server_id) +
