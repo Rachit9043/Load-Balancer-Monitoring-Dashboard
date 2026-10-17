@@ -7,6 +7,9 @@
 #include <sys/socket.h>
 #include <cerrno>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 using namespace std;
 using namespace chrono;
@@ -26,61 +29,218 @@ Backend backends[] = {
 
 const int BACKEND_COUNT = 3;
 
+// Algorithm IDs:
+// 1 = Round Robin
+// 2 = Least Response Time
+// 3 = Weighted Round Robin
+
 int current_backend = 0;
 int wrr_backend = 0;
 int wrr_slot = 0;
 int next_unmeasured = 0;
 
+// Response-time statistics.
 double avg_response_time[BACKEND_COUNT] = {};
 int response_count[BACKEND_COUNT] = {};
+bool server_healthy[BACKEND_COUNT] = {true, true, true};
 
-// Algorithm 1: Round Robin
-// Algorithm 2: Least Response Time
-// Algorithm 3: Weighted Round Robin
+// Adaptive controller settings.
+const int MIN_SAMPLES = 3;
+const double LRT_DIFFERENCE_THRESHOLD = 0.30;
+const int SWITCH_COOLDOWN_REQUESTS = 10;
+
+int requests_since_switch = SWITCH_COOLDOWN_REQUESTS;
+
+// Convert algorithm ID to its database name.
+string algorithmName(int algorithm) {
+    if (algorithm == 1) return "ROUND_ROBIN";
+    if (algorithm == 2) return "LEAST_RESPONSE_TIME";
+    return "WEIGHTED_ROUND_ROBIN";
+}
+
+// Convert database name to algorithm ID.
+int algorithmId(const string& name) {
+    if (name == "LEAST_RESPONSE_TIME") return 2;
+    if (name == "WEIGHTED_ROUND_ROBIN") return 3;
+    return 1;
+}
+
+// Select a backend using the chosen algorithm.
 Backend selectBackend(int algorithm) {
+    vector<int> healthy;
 
-    if (algorithm == 1) {
-        Backend selected = backends[current_backend];
-        current_backend = (current_backend + 1) % BACKEND_COUNT;
-        return selected;
+    for (int i = 0; i < BACKEND_COUNT; i++) {
+        if (server_healthy[i]) {
+            healthy.push_back(i);
+        }
     }
 
+    // If all servers appear unhealthy, try them all.
+    // This allows the system to recover when a backend returns.
+    if (healthy.empty()) {
+        for (int i = 0; i < BACKEND_COUNT; i++) {
+            healthy.push_back(i);
+        }
+    }
+
+    // Round Robin.
+    if (algorithm == 1) {
+        for (int i = 0; i < BACKEND_COUNT; i++) {
+            int index = current_backend;
+            current_backend = (current_backend + 1) % BACKEND_COUNT;
+
+            if (server_healthy[index] || healthy.size() == BACKEND_COUNT) {
+                return backends[index];
+            }
+        }
+
+        return backends[healthy.front()];
+    }
+
+    // Least Response Time.
     if (algorithm == 2) {
+        // Give unmeasured healthy servers a chance first.
         for (int i = 0; i < BACKEND_COUNT; i++) {
             int index = (next_unmeasured + i) % BACKEND_COUNT;
 
-            if (response_count[index] == 0) {
+            if (server_healthy[index] && response_count[index] == 0) {
                 next_unmeasured = (index + 1) % BACKEND_COUNT;
                 return backends[index];
             }
         }
 
-        int best = 0;
+        int best = healthy.front();
 
-        for (int i = 1; i < BACKEND_COUNT; i++) {
-            if (avg_response_time[i] < avg_response_time[best]) {
-                best = i;
+        for (int index : healthy) {
+            if (response_count[index] == 0) {
+                return backends[index];
+            }
+
+            if (avg_response_time[index] < avg_response_time[best]) {
+                best = index;
             }
         }
 
         return backends[best];
     }
 
-    // Weighted Round Robin
-    Backend selected = backends[wrr_backend];
-    wrr_slot++;
+    // Weighted Round Robin.
+    int total_weight = 0;
 
-    if (wrr_slot >= backends[wrr_backend].weight) {
-        wrr_slot = 0;
-        wrr_backend = (wrr_backend + 1) % BACKEND_COUNT;
+    for (int index : healthy) {
+        total_weight += max(1, backends[index].weight);
     }
 
-    return selected;
+    int slot = wrr_slot % total_weight;
+    wrr_slot++;
+
+    for (int index : healthy) {
+        int weight = max(1, backends[index].weight);
+
+        if (slot < weight) {
+            return backends[index];
+        }
+
+        slot -= weight;
+    }
+
+    return backends[healthy.front()];
+}
+
+// Decide which algorithm should be used next.
+int recommendAlgorithm() {
+    vector<double> healthy_averages;
+
+    for (int i = 0; i < BACKEND_COUNT; i++) {
+        if (server_healthy[i] &&
+            response_count[i] >= MIN_SAMPLES) {
+            healthy_averages.push_back(avg_response_time[i]);
+        }
+    }
+
+    // Insufficient measurements: use the default.
+    if (healthy_averages.size() < 2) {
+        return 1;
+    }
+
+    double min_time = *min_element(
+        healthy_averages.begin(), healthy_averages.end()
+    );
+
+    double max_time = *max_element(
+        healthy_averages.begin(), healthy_averages.end()
+    );
+
+    double mean_time = 0.0;
+
+    for (double value : healthy_averages) {
+        mean_time += value;
+    }
+
+    mean_time /= healthy_averages.size();
+
+    // Avoid division by zero.
+    if (mean_time <= 0.0) {
+        return 1;
+    }
+
+    double relative_difference = (max_time - min_time) / mean_time;
+
+    // Significant response-time variation: use LRT.
+    if (relative_difference >= LRT_DIFFERENCE_THRESHOLD) {
+        return 2;
+    }
+
+    // Similar response times: use WRR if weights differ.
+    bool weights_differ = false;
+
+    for (int i = 1; i < BACKEND_COUNT; i++) {
+        if (backends[i].weight != backends[0].weight) {
+            weights_differ = true;
+            break;
+        }
+    }
+
+    if (weights_differ) {
+        return 3;
+    }
+
+    return 1;
+}
+
+// Update the algorithm when the controller recommends a change.
+void adaptAlgorithm(Database& db, int& current_algorithm) {
+    int recommended = recommendAlgorithm();
+
+    if (recommended == current_algorithm) {
+        return;
+    }
+
+    // Avoid rapid switching.
+    if (requests_since_switch < SWITCH_COOLDOWN_REQUESTS) {
+        return;
+    }
+
+    string reason;
+
+    if (recommended == 1) {
+        reason = "Backend response times are similar; using Round Robin";
+    } else if (recommended == 2) {
+        reason = "Significant response-time differences detected; using Least Response Time";
+    } else {
+        reason = "Response times are similar and configured weights differ; using Weighted Round Robin";
+    }
+
+    db.setAlgorithm(algorithmName(recommended), reason);
+
+    current_algorithm = recommended;
+    requests_since_switch = 0;
+
+    cout << "[ADAPTIVE CONTROLLER] Active algorithm: "
+         << algorithmName(current_algorithm) << endl;
 }
 
 int main() {
-
-    // Connect to SQLite and initialize database tables.
     Database db;
 
     if (!db.isConnected()) {
@@ -88,33 +248,14 @@ int main() {
         return 1;
     }
 
-    int algorithm_choice;
+    // Start automatically with the algorithm stored in SQLite.
+    int current_algorithm = algorithmId(db.getAlgorithm());
 
-    cout << "Choose Load Balancing Algorithm:\n";
-    cout << "1. Round Robin\n";
-    cout << "2. Least Response Time\n";
-    cout << "3. Weighted Round Robin\n";
-    cout << "Enter choice: ";
+    cout << "Adaptive Load Balancer Starting..." << endl;
+    cout << "Initial algorithm: "
+         << algorithmName(current_algorithm) << endl;
 
-    if (!(cin >> algorithm_choice) ||
-        algorithm_choice < 1 || algorithm_choice > 3) {
-        cerr << "Invalid algorithm choice." << endl;
-        return 1;
-    }
-
-    string algorithm_name;
-
-    if (algorithm_choice == 1) {
-        algorithm_name = "ROUND_ROBIN";
-    } else if (algorithm_choice == 2) {
-        algorithm_name = "LEAST_RESPONSE_TIME";
-    } else {
-        algorithm_name = "WEIGHTED_ROUND_ROBIN";
-    }
-
-    db.setAlgorithm(algorithm_name, "Selected at startup");
-
-    // Create TCP socket for load balancer.
+    // Create TCP socket for the load balancer.
     int lb_socket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (lb_socket < 0) {
@@ -123,7 +264,6 @@ int main() {
     }
 
     int opt = 1;
-
     setsockopt(lb_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in lb_address{};
@@ -144,10 +284,8 @@ int main() {
     }
 
     cout << "Load balancer listening on port 8080" << endl;
-    cout << "Active algorithm: " << algorithm_name << endl;
 
     while (true) {
-
         sockaddr_in client_address{};
         socklen_t client_size = sizeof(client_address);
 
@@ -159,6 +297,7 @@ int main() {
 
         if (client_socket < 0) {
             if (errno == EINTR) continue;
+
             perror("Client accept failed");
             continue;
         }
@@ -177,7 +316,8 @@ int main() {
             continue;
         }
 
-        Backend backend = selectBackend(algorithm_choice);
+        // Select a backend using the active algorithm.
+        Backend backend = selectBackend(current_algorithm);
         int index = backend.server_id - 1;
 
         cout << "\nForwarding request to Backend Server "
@@ -185,18 +325,22 @@ int main() {
 
         auto start_time = steady_clock::now();
 
-        // Create backend socket.
         int backend_socket = socket(AF_INET, SOCK_STREAM, 0);
 
         if (backend_socket < 0) {
             perror("Backend socket failed");
+
             db.logRequest(backend.server_id, 0.0, false);
             db.updateServerStatus(backend.server_id, "DOWN", 0);
+
+            server_healthy[index] = false;
+            requests_since_switch++;
+
             close(client_socket);
+            adaptAlgorithm(db, current_algorithm);
             continue;
         }
 
-        // Configure backend address.
         sockaddr_in backend_address{};
         backend_address.sin_family = AF_INET;
         backend_address.sin_port = htons(backend.port);
@@ -206,53 +350,58 @@ int main() {
                 backend.ip.c_str(),
                 &backend_address.sin_addr
             ) <= 0) {
-
             cerr << "Invalid backend IP address." << endl;
 
             db.logRequest(backend.server_id, 0.0, false);
             db.updateServerStatus(backend.server_id, "DOWN", 0);
 
+            server_healthy[index] = false;
+            requests_since_switch++;
+
             close(backend_socket);
             close(client_socket);
+            adaptAlgorithm(db, current_algorithm);
             continue;
         }
 
-        // Connect to selected backend.
         if (connect(
                 backend_socket,
                 (sockaddr*)&backend_address,
                 sizeof(backend_address)
             ) < 0) {
-
             perror("Backend connection failed");
 
             db.logRequest(backend.server_id, 0.0, false);
             db.updateServerStatus(backend.server_id, "DOWN", 0);
 
+            server_healthy[index] = false;
+            requests_since_switch++;
+
             close(backend_socket);
             close(client_socket);
+            adaptAlgorithm(db, current_algorithm);
             continue;
         }
 
-        // Forward client request.
         if (send(
                 backend_socket,
                 buffer,
                 bytes_received,
                 0
             ) < 0) {
-
             perror("Request forwarding failed");
 
             db.logRequest(backend.server_id, 0.0, false);
             db.updateServerStatus(backend.server_id, "UP", 0);
 
+            requests_since_switch++;
+
             close(backend_socket);
             close(client_socket);
+            adaptAlgorithm(db, current_algorithm);
             continue;
         }
 
-        // Receive backend response.
         char response[1024] = {};
 
         ssize_t response_size = recv(
@@ -263,21 +412,20 @@ int main() {
         );
 
         if (response_size > 0) {
-
             auto end_time = steady_clock::now();
 
             double response_time = duration<double, milli>(
                 end_time - start_time
             ).count();
 
-            // Update average response time.
+            // Update the response-time average.
             avg_response_time[index] =
                 (avg_response_time[index] * response_count[index]
                  + response_time) / (response_count[index] + 1);
 
             response_count[index]++;
+            server_healthy[index] = true;
 
-            // Save successful request and backend status.
             db.logRequest(backend.server_id, response_time, true);
             db.updateServerStatus(backend.server_id, "UP", 0);
 
@@ -288,7 +436,6 @@ int main() {
                  << " average response time: "
                  << avg_response_time[index] << " ms" << endl;
 
-            // Return response to client.
             if (send(
                     client_socket,
                     response,
@@ -297,16 +444,22 @@ int main() {
                 ) < 0) {
                 perror("Client response failed");
             }
-
         } else {
             cerr << "Backend returned no response." << endl;
 
             db.logRequest(backend.server_id, 0.0, false);
             db.updateServerStatus(backend.server_id, "DOWN", 0);
+
+            server_healthy[index] = false;
         }
 
         close(backend_socket);
         close(client_socket);
+
+        requests_since_switch++;
+
+        // Re-evaluate after collecting the latest result.
+        adaptAlgorithm(db, current_algorithm);
     }
 
     close(lb_socket);
