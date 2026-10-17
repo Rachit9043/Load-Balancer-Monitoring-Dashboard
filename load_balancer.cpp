@@ -1,4 +1,4 @@
-
+#include "database.h"
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -34,40 +34,31 @@ int next_unmeasured = 0;
 double avg_response_time[BACKEND_COUNT] = {};
 int response_count[BACKEND_COUNT] = {};
 
-// Round Robin, Least Response Time, Weighted Round Robin
+// Algorithm 1: Round Robin
+// Algorithm 2: Least Response Time
+// Algorithm 3: Weighted Round Robin
 Backend selectBackend(int algorithm) {
 
-    // 1. Round Robin
     if (algorithm == 1) {
         Backend selected = backends[current_backend];
-        current_backend =
-            (current_backend + 1) % BACKEND_COUNT;
-
+        current_backend = (current_backend + 1) % BACKEND_COUNT;
         return selected;
     }
 
-    // 2. Least Response Time
     if (algorithm == 2) {
-
-        // Give unmeasured backends an initial opportunity
         for (int i = 0; i < BACKEND_COUNT; i++) {
-            int index =
-                (next_unmeasured + i) % BACKEND_COUNT;
+            int index = (next_unmeasured + i) % BACKEND_COUNT;
 
             if (response_count[index] == 0) {
-                next_unmeasured =
-                    (index + 1) % BACKEND_COUNT;
-
+                next_unmeasured = (index + 1) % BACKEND_COUNT;
                 return backends[index];
             }
         }
 
-        // Select the backend with the lowest average time
         int best = 0;
 
         for (int i = 1; i < BACKEND_COUNT; i++) {
-            if (avg_response_time[i] <
-                avg_response_time[best]) {
+            if (avg_response_time[i] < avg_response_time[best]) {
                 best = i;
             }
         }
@@ -75,21 +66,27 @@ Backend selectBackend(int algorithm) {
         return backends[best];
     }
 
-    // 3. Weighted Round Robin
+    // Weighted Round Robin
     Backend selected = backends[wrr_backend];
-
     wrr_slot++;
 
     if (wrr_slot >= backends[wrr_backend].weight) {
         wrr_slot = 0;
-        wrr_backend =
-            (wrr_backend + 1) % BACKEND_COUNT;
+        wrr_backend = (wrr_backend + 1) % BACKEND_COUNT;
     }
 
     return selected;
 }
 
 int main() {
+
+    // Connect to SQLite and initialize database tables.
+    Database db;
+
+    if (!db.isConnected()) {
+        cerr << "Database connection failed." << endl;
+        return 1;
+    }
 
     int algorithm_choice;
 
@@ -98,14 +95,26 @@ int main() {
     cout << "2. Least Response Time\n";
     cout << "3. Weighted Round Robin\n";
     cout << "Enter choice: ";
-    cin >> algorithm_choice;
 
-    if (algorithm_choice < 1 || algorithm_choice > 3) {
-        cerr << "Invalid algorithm choice" << endl;
+    if (!(cin >> algorithm_choice) ||
+        algorithm_choice < 1 || algorithm_choice > 3) {
+        cerr << "Invalid algorithm choice." << endl;
         return 1;
     }
 
-    // Create TCP socket for load balancer
+    string algorithm_name;
+
+    if (algorithm_choice == 1) {
+        algorithm_name = "ROUND_ROBIN";
+    } else if (algorithm_choice == 2) {
+        algorithm_name = "LEAST_RESPONSE_TIME";
+    } else {
+        algorithm_name = "WEIGHTED_ROUND_ROBIN";
+    }
+
+    db.setAlgorithm(algorithm_name, "Selected at startup");
+
+    // Create TCP socket for load balancer.
     int lb_socket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (lb_socket < 0) {
@@ -115,17 +124,14 @@ int main() {
 
     int opt = 1;
 
-    setsockopt(lb_socket, SOL_SOCKET, SO_REUSEADDR,
-               &opt, sizeof(opt));
+    setsockopt(lb_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // Listen on port 8080
     sockaddr_in lb_address{};
     lb_address.sin_family = AF_INET;
     lb_address.sin_addr.s_addr = INADDR_ANY;
     lb_address.sin_port = htons(8080);
 
-    if (bind(lb_socket, (sockaddr*)&lb_address,
-             sizeof(lb_address)) < 0) {
+    if (bind(lb_socket, (sockaddr*)&lb_address, sizeof(lb_address)) < 0) {
         perror("Load balancer bind failed");
         close(lb_socket);
         return 1;
@@ -137,8 +143,8 @@ int main() {
         return 1;
     }
 
-    cout << "Load balancer listening on port 8080"
-         << endl;
+    cout << "Load balancer listening on port 8080" << endl;
+    cout << "Active algorithm: " << algorithm_name << endl;
 
     while (true) {
 
@@ -153,17 +159,17 @@ int main() {
 
         if (client_socket < 0) {
             if (errno == EINTR) continue;
-
             perror("Client accept failed");
             continue;
         }
 
-        // Read client's request
         char buffer[1024] = {};
 
         ssize_t bytes_received = recv(
-            client_socket, buffer,
-            sizeof(buffer) - 1, 0
+            client_socket,
+            buffer,
+            sizeof(buffer) - 1,
+            0
         );
 
         if (bytes_received <= 0) {
@@ -171,101 +177,132 @@ int main() {
             continue;
         }
 
-        // Select backend
         Backend backend = selectBackend(algorithm_choice);
-
         int index = backend.server_id - 1;
 
-        cout << "Forwarding request to Backend Server "
+        cout << "\nForwarding request to Backend Server "
              << backend.server_id << endl;
 
-        // Start measuring backend response time
         auto start_time = steady_clock::now();
 
-        // Connect to selected backend
-        int backend_socket =
-            socket(AF_INET, SOCK_STREAM, 0);
+        // Create backend socket.
+        int backend_socket = socket(AF_INET, SOCK_STREAM, 0);
 
         if (backend_socket < 0) {
             perror("Backend socket failed");
+            db.logRequest(backend.server_id, 0.0, false);
+            db.updateServerStatus(backend.server_id, "DOWN", 0);
             close(client_socket);
             continue;
         }
 
+        // Configure backend address.
         sockaddr_in backend_address{};
         backend_address.sin_family = AF_INET;
         backend_address.sin_port = htons(backend.port);
 
-        if (inet_pton(AF_INET, backend.ip.c_str(),
-                      &backend_address.sin_addr) <= 0) {
-            cerr << "Invalid backend IP address" << endl;
+        if (inet_pton(
+                AF_INET,
+                backend.ip.c_str(),
+                &backend_address.sin_addr
+            ) <= 0) {
+
+            cerr << "Invalid backend IP address." << endl;
+
+            db.logRequest(backend.server_id, 0.0, false);
+            db.updateServerStatus(backend.server_id, "DOWN", 0);
+
             close(backend_socket);
             close(client_socket);
             continue;
         }
 
-        if (connect(backend_socket,
-                    (sockaddr*)&backend_address,
-                    sizeof(backend_address)) < 0) {
+        // Connect to selected backend.
+        if (connect(
+                backend_socket,
+                (sockaddr*)&backend_address,
+                sizeof(backend_address)
+            ) < 0) {
+
             perror("Backend connection failed");
+
+            db.logRequest(backend.server_id, 0.0, false);
+            db.updateServerStatus(backend.server_id, "DOWN", 0);
+
             close(backend_socket);
             close(client_socket);
             continue;
         }
 
-        // Forward request to backend
-        if (send(backend_socket, buffer,
-                 bytes_received, 0) < 0) {
+        // Forward client request.
+        if (send(
+                backend_socket,
+                buffer,
+                bytes_received,
+                0
+            ) < 0) {
+
             perror("Request forwarding failed");
+
+            db.logRequest(backend.server_id, 0.0, false);
+            db.updateServerStatus(backend.server_id, "UP", 0);
+
             close(backend_socket);
             close(client_socket);
             continue;
         }
 
-        // Receive backend response
+        // Receive backend response.
         char response[1024] = {};
 
         ssize_t response_size = recv(
-            backend_socket, response,
-            sizeof(response) - 1, 0
+            backend_socket,
+            response,
+            sizeof(response) - 1,
+            0
         );
 
         if (response_size > 0) {
 
-            // Calculate response time in milliseconds
             auto end_time = steady_clock::now();
 
-            double response_time =
-                duration<double, milli>(
-                    end_time - start_time
-                ).count();
+            double response_time = duration<double, milli>(
+                end_time - start_time
+            ).count();
 
-            // Update running average for this backend
+            // Update average response time.
             avg_response_time[index] =
-                (avg_response_time[index] *
-                 response_count[index] + response_time) /
-                (response_count[index] + 1);
+                (avg_response_time[index] * response_count[index]
+                 + response_time) / (response_count[index] + 1);
 
             response_count[index]++;
 
+            // Save successful request and backend status.
+            db.logRequest(backend.server_id, response_time, true);
+            db.updateServerStatus(backend.server_id, "UP", 0);
+
             cout << "Server " << backend.server_id
-                 << " response time: "
-                 << response_time << " ms" << endl;
+                 << " response time: " << response_time << " ms" << endl;
 
             cout << "Server " << backend.server_id
                  << " average response time: "
-                 << avg_response_time[index] << " ms"
-                 << endl;
+                 << avg_response_time[index] << " ms" << endl;
 
-            // Return response to client
-            if (send(client_socket, response,
-                     response_size, 0) < 0) {
+            // Return response to client.
+            if (send(
+                    client_socket,
+                    response,
+                    response_size,
+                    0
+                ) < 0) {
                 perror("Client response failed");
             }
 
         } else {
-            cerr << "Backend returned no response"
-                 << endl;
+            cerr << "Backend returned no response." << endl;
+
+            db.logRequest(backend.server_id, 0.0, false);
+            db.updateServerStatus(backend.server_id, "DOWN", 0);
         }
 
         close(backend_socket);
